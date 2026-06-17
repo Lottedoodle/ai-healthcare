@@ -1,0 +1,58 @@
+name: Build Template
+
+on:
+  workflow_call:
+    secrets:
+      NEXT_PUBLIC_SUPABASE_URL:
+        required: true
+      NEXT_PUBLIC_SUPABASE_PUBLISHABLE_OR_ANON_KEY:
+        required: true
+    outputs:
+      image-tag:
+        description: "Docker image tag (commit SHA)"
+        value: ${{ jobs.build.outputs.image-tag }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set image tag
+        id: meta
+        run: echo "tag=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          # Tag with both SHA (traceability) and latest (convenience)
+          tags: |
+            test-app:${{ steps.meta.outputs.tag }}
+            test-app:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            NEXT_PUBLIC_SUPABASE_URL=${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+            NEXT_PUBLIC_SUPABASE_PUBLISHABLE_OR_ANON_KEY=${{ secrets.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_OR_ANON_KEY }}
+
+      - name: Save Docker image as artifact
+        run: docker save test-app:latest test-app:${{ steps.meta.outputs.tag }} | gzip > image.tar.gz
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: image.tar.gz
+          retention-days: 1

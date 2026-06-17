@@ -1,0 +1,102 @@
+name: Test Template
+
+on:
+  workflow_call:
+    secrets:
+      DATABASE_URL:
+        required: true
+      OPENAI_API_KEY:
+        required: true
+      OPENAI_MODEL_NAME:
+        required: true
+      OPENAI_EMBEDDING_MODEL_NAME:
+        required: true
+      NEXT_PUBLIC_SUPABASE_URL:
+        required: true
+      NEXT_PUBLIC_SUPABASE_PUBLISHABLE_OR_ANON_KEY:
+        required: true
+
+jobs:
+  k6-performance:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Docker image
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+
+      - name: Load Docker image
+        run: gunzip -c image.tar.gz | docker load
+
+      - name: Show loaded images
+        run: docker images
+
+      # Mask secrets before any step that may print env output
+      - name: Mask secrets from logs
+        run: |
+          echo "::add-mask::${{ secrets.DATABASE_URL }}"
+          echo "::add-mask::${{ secrets.OPENAI_API_KEY }}"
+          echo "::add-mask::${{ secrets.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_OR_ANON_KEY }}"
+
+      - name: Run App Container
+        run: |
+          docker run -d \
+            --name app-container \
+            -p 3000:3000 \
+            -e DATABASE_URL="${{ secrets.DATABASE_URL }}" \
+            -e OPENAI_API_KEY="${{ secrets.OPENAI_API_KEY }}" \
+            -e OPENAI_MODEL_NAME="${{ secrets.OPENAI_MODEL_NAME }}" \
+            -e OPENAI_EMBEDDING_MODEL_NAME="${{ secrets.OPENAI_EMBEDDING_MODEL_NAME }}" \
+            -e NEXT_PUBLIC_SUPABASE_URL="${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}" \
+            -e NEXT_PUBLIC_SUPABASE_PUBLISHABLE_OR_ANON_KEY="${{ secrets.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_OR_ANON_KEY }}" \
+            -e ALLOW_TEST_BYPASS="true" \
+            test-app:latest
+
+      - name: Show running containers
+        run: docker ps -a
+
+      - name: Wait for API to be ready
+        run: |
+          echo "Waiting for API to be ready..."
+          timeout 90s sh -c 'until curl -sf http://localhost:3000 > /dev/null; do echo "Still waiting..."; sleep 2; done'
+          echo "API is ready."
+
+      - name: Debug API response
+        run: |
+          curl -sf -o /dev/null -w "HTTP %{http_code}\n" \
+            -X POST http://localhost:3000/api/chat \
+            -H "Content-Type: application/json" \
+            -d '{"messages":[{"role":"user","parts":[{"type":"text","text":"CI performance test"}]}]}'
+
+      - name: Execute k6
+        run: |
+          docker run --rm \
+            --network host \
+            -u "$(id -u):$(id -g)" \
+            -v "$PWD:/scripts" \
+            ghcr.io/grafana/k6:latest \
+            run \
+            --env BASE_URL=http://localhost:3000 \
+            --out json=/scripts/results.json \
+            /scripts/performance-test.js
+
+      - name: Show container logs on failure
+        if: failure()
+        run: docker logs app-container || true
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f app-container 2>/dev/null || true
+
+      - name: Archive Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: k6-report
+          path: results.json

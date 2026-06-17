@@ -1,0 +1,350 @@
+name: Production Pipeline
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Prevent concurrent deployments to the same environment.
+# A new push cancels any in-progress run so only the latest commit deploys.
+concurrency:
+  group: production-deploy
+  cancel-in-progress: true
+
+jobs:
+  # ─────────────────────────────────────────────
+  # 1. Build Docker image (no push yet)
+  # ─────────────────────────────────────────────
+  call-build:
+    uses: ./.github/workflows/_build.yml
+    secrets: inherit
+
+  # ─────────────────────────────────────────────
+  # 2. Run k6 performance tests against the image
+  # ─────────────────────────────────────────────
+  call-test:
+    needs: [call-build]
+    uses: ./.github/workflows/_test.yml
+    secrets: inherit
+
+  # ─────────────────────────────────────────────
+  # 3. Push image to ECR (only if tests pass)
+  # ─────────────────────────────────────────────
+  push-to-ecr:
+    needs: [call-test]
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write  # required for OIDC authentication
+
+    outputs:
+      image-uri: ${{ steps.push.outputs.image-uri }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Docker image
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+
+      - name: Load Docker image
+        run: docker load < image.tar.gz
+
+      # OIDC — no long-lived AWS keys stored as secrets
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Create ECR repo if missing
+        run: |
+          aws ecr describe-repositories \
+            --repository-names "${{ secrets.ECR_REPOSITORY }}" 2>/dev/null || \
+          aws ecr create-repository \
+            --repository-name "${{ secrets.ECR_REPOSITORY }}"
+
+      - name: Tag and push image to ECR
+        id: push
+        run: |
+          REGISTRY="${{ steps.ecr-login.outputs.registry }}"
+          REPO="${{ secrets.ECR_REPOSITORY }}"
+          SHA_TAG="${REGISTRY}/${REPO}:${{ github.sha }}"
+          LATEST_TAG="${REGISTRY}/${REPO}:latest"
+
+          docker tag test-app:latest "$SHA_TAG"
+          docker tag test-app:latest "$LATEST_TAG"
+          docker push "$SHA_TAG"
+          docker push "$LATEST_TAG"
+
+          echo "image-uri=${SHA_TAG}" >> "$GITHUB_OUTPUT"
+          echo "Pushed: $SHA_TAG"
+          echo "Pushed: $LATEST_TAG"
+
+  # ─────────────────────────────────────────────
+  # 4. Deploy to ECS (only if push succeeds)
+  # ─────────────────────────────────────────────
+  deploy-to-ecs:
+    needs: [push-to-ecr]
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write  # required for OIDC authentication
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify required secrets
+        env:
+          AWS_REGION:          ${{ secrets.AWS_REGION }}
+          AWS_ROLE_TO_ASSUME:  ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          ECR_REPOSITORY:      ${{ secrets.ECR_REPOSITORY }}
+          ECS_CLUSTER:         ${{ secrets.ECS_CLUSTER }}
+          ECS_SERVICE:         ${{ secrets.ECS_SERVICE }}
+          ECS_TASK_DEFINITION: ${{ secrets.ECS_TASK_DEFINITION }}
+          CONTAINER_NAME:      ${{ secrets.CONTAINER_NAME }}
+          SUBNET_ID:           ${{ secrets.SUBNET_ID }}
+          SECURITY_GROUP_ID:   ${{ secrets.SECURITY_GROUP_ID }}
+          AWS_ACCOUNT_ID:      ${{ secrets.AWS_ACCOUNT_ID }}
+        run: |
+          missing=()
+          for v in AWS_REGION AWS_ROLE_TO_ASSUME ECR_REPOSITORY ECS_CLUSTER ECS_SERVICE \
+                   ECS_TASK_DEFINITION CONTAINER_NAME SUBNET_ID SECURITY_GROUP_ID AWS_ACCOUNT_ID; do
+            if [ -z "${!v}" ]; then missing+=("$v"); fi
+          done
+          if [ ${#missing[@]} -ne 0 ]; then
+            echo "::error::Missing required GitHub secrets: ${missing[*]}"
+            echo "Set them at: Repo → Settings → Secrets and variables → Actions"
+            exit 1
+          fi
+          echo "All required secrets are set."
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Verify AWS context (account, region, subnets, SG)
+        run: |
+          echo "== Caller identity =="
+          aws sts get-caller-identity
+
+          echo "== Subnet check =="
+          IFS=',' read -ra SUBNETS <<< "${{ secrets.SUBNET_ID }}"
+          for s in "${SUBNETS[@]}"; do
+            echo "Checking subnet: $s"
+            if ! aws ec2 describe-subnets --subnet-ids "$s" \
+                  --query 'Subnets[0].[SubnetId,VpcId,AvailabilityZone]' --output text; then
+              echo "::error::Subnet '$s' not found in region '${{ secrets.AWS_REGION }}'"
+              exit 1
+            fi
+          done
+
+          echo "== Security group check =="
+          IFS=',' read -ra SGS <<< "${{ secrets.SECURITY_GROUP_ID }}"
+          for g in "${SGS[@]}"; do
+            echo "Checking SG: $g"
+            if ! aws ec2 describe-security-groups --group-ids "$g" \
+                  --query 'SecurityGroups[0].[GroupId,VpcId,GroupName]' --output text; then
+              echo "::error::Security Group '$g' not found in region '${{ secrets.AWS_REGION }}'"
+              exit 1
+            fi
+          done
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Ensure CloudWatch log group exists
+        run: |
+          LOG_GROUP="/ecs/${{ secrets.ECS_TASK_DEFINITION }}"
+          if aws logs describe-log-groups \
+               --log-group-name-prefix "$LOG_GROUP" \
+               --query "logGroups[?logGroupName=='$LOG_GROUP'] | length(@)" \
+               --output text | grep -q '^1$'; then
+            echo "Log group $LOG_GROUP already exists."
+          else
+            echo "Creating log group: $LOG_GROUP"
+            aws logs create-log-group --log-group-name "$LOG_GROUP"
+            aws logs put-retention-policy \
+              --log-group-name "$LOG_GROUP" \
+              --retention-in-days 14
+          fi
+
+      - name: Create ECS cluster if missing
+        run: |
+          aws ecs describe-clusters \
+              --clusters "${{ secrets.ECS_CLUSTER }}" \
+              --query 'clusters[?status==`ACTIVE`].clusterName' \
+              --output text | grep -q "${{ secrets.ECS_CLUSTER }}" || \
+          aws ecs create-cluster \
+            --cluster-name "${{ secrets.ECS_CLUSTER }}" \
+            --capacity-providers FARGATE \
+            --default-capacity-provider-strategy capacityProvider=FARGATE,weight=1
+
+      - name: Register ECS task definition if missing
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "${{ secrets.ECS_TASK_DEFINITION }}" 2>/dev/null || \
+          aws ecs register-task-definition \
+            --family "${{ secrets.ECS_TASK_DEFINITION }}" \
+            --requires-compatibilities FARGATE \
+            --network-mode awsvpc \
+            --cpu "512" \
+            --memory "1024" \
+            --execution-role-arn "arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/ecsTaskExecutionRole" \
+            --container-definitions '[{
+              "name": "${{ secrets.CONTAINER_NAME }}",
+              "image": "${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ secrets.ECR_REPOSITORY }}:latest",
+              "portMappings": [{"containerPort": 3000, "protocol": "tcp"}],
+              "essential": true,
+              "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                  "awslogs-group": "/ecs/${{ secrets.ECS_TASK_DEFINITION }}",
+                  "awslogs-region": "${{ secrets.AWS_REGION }}",
+                  "awslogs-stream-prefix": "ecs"
+                }
+              }
+            }]'
+
+      - name: Create ECS service if missing
+        run: |
+          aws ecs describe-services \
+              --cluster "${{ secrets.ECS_CLUSTER }}" \
+              --services "${{ secrets.ECS_SERVICE }}" \
+              --query 'services[?status==`ACTIVE`].serviceName' \
+              --output text | grep -q "${{ secrets.ECS_SERVICE }}" || \
+          aws ecs create-service \
+            --cluster "${{ secrets.ECS_CLUSTER }}" \
+            --service-name "${{ secrets.ECS_SERVICE }}" \
+            --task-definition "${{ secrets.ECS_TASK_DEFINITION }}" \
+            --desired-count 1 \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[${{ secrets.SUBNET_ID }}],securityGroups=[${{ secrets.SECURITY_GROUP_ID }}],assignPublicIp=ENABLED}"
+
+      - name: Download current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "${{ secrets.ECS_TASK_DEFINITION }}" \
+            --query taskDefinition > task-definition.json
+
+      - name: Strip unsupported logConfiguration options
+        run: |
+          jq 'del(.containerDefinitions[]?.logConfiguration.options."awslogs-create-group")' \
+            task-definition.json > task-definition.stripped.json
+          mv task-definition.stripped.json task-definition.json
+
+      - name: Mask sensitive values before env injection
+        run: |
+          echo "::add-mask::${{ secrets.DATABASE_URL }}"
+          echo "::add-mask::${{ secrets.OPENAI_API_KEY }}"
+          echo "::add-mask::${{ secrets.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_OR_ANON_KEY }}"
+
+      - name: Inject environment variables into task definition
+        # NOTE: Plaintext env vars in ECS task definitions are visible to anyone with
+        # ecs:DescribeTaskDefinition. For production, migrate secrets to AWS Secrets Manager
+        # and reference them via the `secrets` array in the task definition instead.
+        env:
+          CONTAINER_NAME:                                ${{ secrets.CONTAINER_NAME }}
+          DATABASE_URL:                                  ${{ secrets.DATABASE_URL }}
+          OPENAI_API_KEY:                                ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL_NAME:                             ${{ secrets.OPENAI_MODEL_NAME }}
+          OPENAI_EMBEDDING_MODEL_NAME:                   ${{ secrets.OPENAI_EMBEDDING_MODEL_NAME }}
+          NEXT_PUBLIC_SUPABASE_URL:                      ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+          NEXT_PUBLIC_SUPABASE_PUBLISHABLE_OR_ANON_KEY:  ${{ secrets.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_OR_ANON_KEY }}
+        run: |
+          jq --arg name "$CONTAINER_NAME" '
+            .containerDefinitions |= map(
+              if .name == $name then
+                .environment = [
+                  {name: "DATABASE_URL",                                 value: env.DATABASE_URL},
+                  {name: "OPENAI_API_KEY",                               value: env.OPENAI_API_KEY},
+                  {name: "OPENAI_MODEL_NAME",                            value: env.OPENAI_MODEL_NAME},
+                  {name: "OPENAI_EMBEDDING_MODEL_NAME",                  value: env.OPENAI_EMBEDDING_MODEL_NAME},
+                  {name: "NEXT_PUBLIC_SUPABASE_URL",                     value: env.NEXT_PUBLIC_SUPABASE_URL},
+                  {name: "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_OR_ANON_KEY", value: env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_OR_ANON_KEY},
+                  {name: "NODE_ENV",                                     value: "production"}
+                ]
+              else . end
+            )
+          ' task-definition.json > task-definition.with-env.json
+          mv task-definition.with-env.json task-definition.json
+          echo "Environment variables injected for container: $CONTAINER_NAME"
+
+      - name: Render new image into task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ secrets.CONTAINER_NAME }}
+          # Use SHA tag for precise traceability; :latest is also pushed for convenience
+          image: ${{ needs.push-to-ecr.outputs.image-uri }}
+
+      - name: Deploy to Amazon ECS
+        id: deploy
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ secrets.ECS_SERVICE }}
+          cluster: ${{ secrets.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+      - name: Diagnose ECS failure
+        if: failure()
+        run: |
+          set +e
+
+          echo "==================== Service events (latest 20) ===================="
+          aws ecs describe-services \
+            --cluster "${{ secrets.ECS_CLUSTER }}" \
+            --services "${{ secrets.ECS_SERVICE }}" \
+            --query 'services[0].events[0:20].[createdAt,message]' \
+            --output table
+
+          echo "==================== Stopped tasks (latest 5) ===================="
+          STOPPED=$(aws ecs list-tasks \
+            --cluster "${{ secrets.ECS_CLUSTER }}" \
+            --service-name "${{ secrets.ECS_SERVICE }}" \
+            --desired-status STOPPED \
+            --max-items 5 \
+            --query 'taskArns' --output text)
+          echo "Stopped task ARNs: $STOPPED"
+
+          if [ -n "$STOPPED" ] && [ "$STOPPED" != "None" ]; then
+            aws ecs describe-tasks \
+              --cluster "${{ secrets.ECS_CLUSTER }}" \
+              --tasks $STOPPED \
+              --query 'tasks[].{TaskArn:taskArn,StoppedReason:stoppedReason,ExitCode:containers[0].exitCode,ContainerReason:containers[0].reason,LastStatus:lastStatus}' \
+              --output table
+          fi
+
+          echo "==================== Recent CloudWatch logs ===================="
+          LOG_GROUP="/ecs/${{ secrets.ECS_TASK_DEFINITION }}"
+          STREAMS=$(aws logs describe-log-streams \
+            --log-group-name "$LOG_GROUP" \
+            --order-by LastEventTime --descending \
+            --max-items 3 \
+            --query 'logStreams[].logStreamName' --output text 2>/dev/null)
+
+          if [ -z "$STREAMS" ] || [ "$STREAMS" = "None" ]; then
+            echo "(no log streams found — container may not have started)"
+          else
+            for s in $STREAMS; do
+              echo "----- Stream: $s -----"
+              aws logs get-log-events \
+                --log-group-name "$LOG_GROUP" \
+                --log-stream-name "$s" \
+                --limit 100 \
+                --query 'events[].message' --output text
+            done
+          fi
+
+          exit 1
