@@ -363,4 +363,5 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 
 ---
 
+
 > **Note:** This project is under active development (v0.1.0). Some clinical tools (vitals, drug interaction, emergency protocols) currently return mock data and are not yet connected to live hospital systems. Do not use in production clinical environments without proper validation.
